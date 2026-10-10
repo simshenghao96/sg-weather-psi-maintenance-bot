@@ -120,12 +120,37 @@ def get_region(latitude, longitude):
 # ==========================================================
 # PSI / PM2.5 (unchanged logic from the original PSI bot)
 # ==========================================================
+# Optional free data.gov.sg API key (higher rate limits). Add it as the GitHub
+# secret DATA_GOV_SG_API_KEY; the bot works without it.
+API_KEY = os.environ.get("DATA_GOV_SG_API_KEY", "").strip()
+REQUEST_GAP_SECONDS = 0.3  # Small pause after each request to stay under rate limits.
+
+
+def http_get(url, params=None):
+    """GET with an optional API key and automatic retries when rate-limited (429)."""
+    headers = {"x-api-key": API_KEY} if API_KEY else {}
+    for attempt in range(4):
+        response = requests.get(url, params=params, headers=headers, timeout=20)
+        if response.status_code == 429 and attempt < 3:
+            try:
+                wait = min(int(response.headers.get("Retry-After", "")), 30)
+            except ValueError:
+                wait = 5 * (attempt + 1)
+            print(f"data.gov.sg rate limit hit; waiting {wait}s before retrying.")
+            time_module.sleep(wait)
+            continue
+        response.raise_for_status()
+        time_module.sleep(REQUEST_GAP_SECONDS)
+        return response
+    response.raise_for_status()
+    return response
+
+
 def fetch_items(day=None, url=PSI_URL):
     params = {} if day is None else {"date": day.isoformat()}
     items, seen = [], set()
     for _ in range(20):
-        response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
+        response = http_get(url, params=params)
         payload = response.json()
         if payload.get("code") != 0:
             raise ValueError("PSI API returned an error.")
@@ -226,8 +251,7 @@ def get_pm25(now):
 # WEATHER DATA (from the original weather bot)
 # ==========================================================
 def fetch_weather(url):
-    response = requests.get(url, timeout=20)
-    response.raise_for_status()
+    response = http_get(url)
     payload = response.json()
     if payload.get("code") != 0:
         raise ValueError("Weather API returned an error.")
@@ -770,42 +794,63 @@ def draw_legend_row(ax, y_top, title, bands):
     for index, (_limit, label, rng, fill, ink) in enumerate(bands):
         x = index * (width + gap)
         ax.add_patch(matplotlib.patches.FancyBboxPatch(
-            (x, y_top - 0.34), width, 0.22,
+            (x, y_top - 0.21), width, 0.15,
             boxstyle="round,pad=0,rounding_size=0.01",
             facecolor=fill, edgecolor="none", transform=ax.transAxes))
-        ax.text(x + width / 2, y_top - 0.23, f"{label}\n{rng}", ha="center",
+        ax.text(x + width / 2, y_top - 0.135, f"{label}\n{rng}", ha="center",
                 va="center", fontsize=9, fontweight="bold", color=ink,
                 linespacing=1.3, transform=ax.transAxes)
 
 
+def draw_trend_legend(ax, y_top):
+    """Legend for the ▲ ▼ → arrows, with each measure's own threshold."""
+    psi_step, pm_step = TREND_STEADY["psi"], TREND_STEADY["pm25"]
+    ax.text(0.0, y_top, "Change vs previous hour (arrow beside each reading)",
+            ha="left", va="top", fontsize=10, fontweight="bold", color="#1F2937")
+    boxes = [
+        ("▲ Rising", f"PSI +{psi_step} or more", f"PM2.5 +{pm_step} or more"),
+        ("▼ Easing", f"PSI −{psi_step} or more", f"PM2.5 −{pm_step} or more"),
+        ("→ Steady", f"PSI within ±{psi_step - 1}", f"PM2.5 within ±{pm_step - 1}"),
+    ]
+    gap = 0.012
+    width = (1 - gap * (len(boxes) - 1)) / len(boxes)
+    for index, (label, psi_rule, pm_rule) in enumerate(boxes):
+        x = index * (width + gap)
+        ax.add_patch(matplotlib.patches.FancyBboxPatch(
+            (x, y_top - 0.27), width, 0.21,
+            boxstyle="round,pad=0,rounding_size=0.01",
+            facecolor="#E5E7EB", edgecolor="none", transform=ax.transAxes))
+        ax.text(x + width / 2, y_top - 0.165, f"{label}\n{psi_rule}\n{pm_rule}",
+                ha="center", va="center", fontsize=9, fontweight="bold",
+                color="#1F2937", linespacing=1.35, transform=ax.transAxes)
+
+
 def make_map_image(data):
     psi, pm25 = data.get("psi"), data.get("pm25")
-    fig = plt.figure(figsize=(8, 11.0), dpi=130)
+    fig = plt.figure(figsize=(8, 12.2), dpi=130)
     try:
         fig.patch.set_facecolor("white")
         psi_title = "24-hour PSI" + (f" · {as_of(psi)}" if psi else "")
         pm_title = "1-hour PM2.5 (µg/m³)" + (f" · {as_of(pm25)}" if pm25 else "")
-        draw_map_panel(fig.add_axes([0.03, 0.6727, 0.94, 0.2909]), psi_title, psi, PSI_BANDS, "psi")
-        draw_map_panel(fig.add_axes([0.03, 0.3409, 0.94, 0.2909]), pm_title, pm25, PM25_BANDS, "pm25")
+        draw_map_panel(fig.add_axes([0.03, 0.7049, 0.94, 0.2623]), psi_title, psi, PSI_BANDS, "psi")
+        draw_map_panel(fig.add_axes([0.03, 0.4057, 0.94, 0.2623]), pm_title, pm25, PM25_BANDS, "pm25")
 
-        legend = fig.add_axes([0.03, 0.0546, 0.94, 0.2636])
+        legend = fig.add_axes([0.03, 0.0328, 0.94, 0.3525])
         legend.axis("off")
         legend.set_xlim(0, 1)
         legend.set_ylim(0, 1)
         legend.text(0.0, 1.0, "LEGEND", ha="left", va="top", fontsize=12.5,
                     fontweight="bold", color="#1F2937")
-        legend.text(0.0, 0.925,
+        legend.text(0.0, 0.945,
                     "What each reading range means: the further from green, "
                     "the worse the air quality",
                     ha="left", va="top", fontsize=9, color="#4B5563")
-        legend.plot([0, 1], [0.87, 0.87], color="#D1D5DB", linewidth=1,
+        legend.plot([0, 1], [0.905, 0.905], color="#D1D5DB", linewidth=1,
                     transform=legend.transAxes)
-        draw_legend_row(legend, 0.83, "24-hour PSI", PSI_BANDS)
-        draw_legend_row(legend, 0.43, "1-hour PM2.5 (µg/m³)", PM25_BANDS)
-        fig.text(0.03, 0.034,
-                 "Arrows show the change since the previous hour: ▲ rising · ▼ easing · → steady",
-                 fontsize=8.5, color="#6B7280")
-        fig.text(0.03, 0.016,
+        draw_legend_row(legend, 0.875, "24-hour PSI", PSI_BANDS)
+        draw_legend_row(legend, 0.625, "1-hour PM2.5 (µg/m³)", PM25_BANDS)
+        draw_trend_legend(legend, 0.375)
+        fig.text(0.03, 0.012,
                  "Schematic map, not to scale · Source: NEA / data.gov.sg",
                  fontsize=8.5, color="#6B7280")
         output = io.BytesIO()
@@ -849,16 +894,47 @@ def get_previous_values(url, field, reading_time):
     return None
 
 
-def add_previous(data):
+RECENT_KEEP = 6  # Readings remembered per measure.
+
+
+def hour_key(moment):
+    return moment.replace(minute=0, second=0, microsecond=0).isoformat()
+
+
+def add_previous(data, records):
+    """Attach the previous hour's values: from saved memory first, else data.gov.sg."""
+    recent = records.setdefault("recent", {})
     for kind, (url, field, _bands, _name) in KINDS.items():
         reading = data.get(kind)
         if not reading:
             continue
+        target = hour_key(reading["time"] - timedelta(hours=1))
+        saved = (recent.get(kind) or {}).get(target)
+        if saved:
+            reading["previous"] = saved
+            print(f"Previous-hour {kind}: found in saved records.")
+            continue
         try:
             reading["previous"] = get_previous_values(url, field, reading["time"])
+            print(f"Previous-hour {kind}: "
+                  + ("found via data.gov.sg." if reading["previous"] else
+                     "not available from data.gov.sg for that hour."))
         except ERRORS as error:
-            print(f"Previous-hour {kind} unavailable ({type(error).__name__}).")
+            print(f"Previous-hour {kind} unavailable from data.gov.sg ({type(error).__name__}).")
             reading["previous"] = None
+
+
+def remember_current(records, data):
+    """Save this run's readings so next hour's run can show trend arrows."""
+    recent = records.setdefault("recent", {})
+    for kind in KINDS:
+        reading = data.get(kind)
+        if not reading:
+            continue
+        saved = recent.setdefault(kind, {})
+        saved[hour_key(reading["time"])] = reading["values"]
+        for old_key in sorted(saved)[:-RECENT_KEEP]:
+            del saved[old_key]
 
 
 def load_records():
@@ -1022,10 +1098,11 @@ def send_hourly_update(token, chat_id):
     # Extra context (trend arrows, alerts). Never blocks the update itself.
     records = load_records()
     try:
-        add_previous(data)
+        add_previous(data, records)
         fill_missing_days(records, now.date())
         data["alerts"] = record_alerts(data, records)
         update_today(records, data)
+        remember_current(records, data)
     except ERRORS as error:
         print(f"Trend/record context unavailable ({type(error).__name__}).")
 
