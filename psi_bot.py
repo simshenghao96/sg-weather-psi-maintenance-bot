@@ -47,6 +47,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "last_sent_psi.txt"
 PM25_STATE_FILE = BASE_DIR / "last_sent_pm25.txt"
 REPORT_FILE = BASE_DIR / "psi_reports.json"
+RECORDS_FILE = BASE_DIR / "psi_records.json"
 
 STALE_SECONDS = 7200  # Readings older than 2 hours are flagged.
 MAX_MESSAGE_LENGTH = 4000  # Telegram's limit is 4096.
@@ -360,13 +361,43 @@ def top_regions(values):
     return highest, ", ".join(r.title() for r in REGIONS if values[r] == highest)
 
 
+# A change smaller than this (vs the previous hour) counts as "steady".
+TREND_STEADY = {"psi": 2, "pm25": 5}
+
+
+def trend_symbol(reading, region, kind):
+    """('▲', 6) rising, ('▼', 4) easing, ('→', 0) steady, ('', 0) unknown."""
+    previous = reading.get("previous")
+    if not previous or region not in previous:
+        return "", 0
+    delta = reading["values"][region] - previous[region]
+    if delta >= TREND_STEADY[kind]:
+        return "▲", delta
+    if delta <= -TREND_STEADY[kind]:
+        return "▼", -delta
+    return "→", 0
+
+
+def trend_text(reading, region, kind):
+    symbol, size = trend_symbol(reading, region, kind)
+    if not symbol:
+        return ""
+    return f" {symbol}{size}" if size else f" {symbol}"
+
+
+def first_top_region(values):
+    highest = max(values.values())
+    return next(r for r in REGIONS if values[r] == highest)
+
+
 def headline_psi(data):
     psi = data.get("psi")
     if not psi:
         return "⚠️ PSI unavailable this hour"
     highest, top = top_regions(psi["values"])
     emoji, label = split_indicator(get_psi_indicator(highest))
-    text = f"{emoji} Highest PSI: {top} {highest} ({label})"
+    trend = trend_text(psi, first_top_region(psi["values"]), "psi")
+    text = f"{emoji} Highest PSI: {top} {highest}{trend} ({label})"
     return text + (" ⚠️ old data" if psi["stale"] else "")
 
 
@@ -376,7 +407,8 @@ def headline_pm25(data):
         return "⚠️ PM2.5 unavailable this hour"
     highest, top = top_regions(pm25["values"])
     emoji, label = split_indicator(get_pm25_indicator(highest))
-    text = f"{emoji} Highest PM2.5: {top} {highest} µg/m³ ({label})"
+    trend = trend_text(pm25, first_top_region(pm25["values"]), "pm25")
+    text = f"{emoji} Highest PM2.5: {top} {highest}{trend} µg/m³ ({label})"
     return text + (" ⚠️ old data" if pm25["stale"] else "")
 
 
@@ -580,6 +612,7 @@ def build_message(data, now, with_details=True):
     header = f"🇸🇬 <b>Singapore Update · {hour.day} {hour:%b}, {clock(hour)}</b>"
     parts = [
         header,
+        "\n".join(data.get("alerts") or []),
         "\n".join(escape(line) for line in
                   (headline_psi(data), headline_pm25(data), headline_weather(data))),
         psi_section(data),
@@ -592,7 +625,7 @@ def build_message(data, now, with_details=True):
         "Source: NEA / data.gov.sg · Guidance: NEA/MOH · haze.gov.sg\n"
         "Regional grouping of stations is approximate."
     ))
-    return "\n\n".join(parts)
+    return "\n\n".join(part for part in parts if part)
 
 
 # ==========================================================
@@ -629,10 +662,13 @@ def build_caption(data, now):
     hour = now.replace(minute=0, second=0, microsecond=0)
     header = f"🇸🇬 <b>Singapore Update · {hour.day} {hour:%b}, {clock(hour)}</b>"
     haze = "\n".join(escape(line) for line in (headline_psi(data), headline_pm25(data)))
-    pointer = ("(Readings for every region: see the map above ⬆️)" if MAP_ABOVE_CAPTION
-               else "(Readings for every region: see the map below ⬇️)")
+    has_trend = any((data.get(k) or {}).get("previous") for k in ("psi", "pm25"))
+    where = "above ⬆️" if MAP_ABOVE_CAPTION else "below ⬇️"
+    pointer = f"(Every region: see the map {where}" + (
+        " · ▲▼ = change vs last hour)" if has_trend else ")")
     haze += f"\n<i>{pointer}</i>"
     weather_line = escape(headline_weather(data))
+    alerts = "\n".join(data.get("alerts") or [])
     psi, pm25 = data.get("psi"), data.get("pm25")
     psi_text = psi_advice(psi) if psi else ""
     pm25_text = pm25_advice(pm25) if pm25 else ""
@@ -642,7 +678,7 @@ def build_caption(data, now):
         (True, True, "short"), (False, True, "short"),
         (False, True, None), (False, False, None),
     ]:
-        parts = [header, haze, weather_line, psi_text]
+        parts = [header, alerts, haze, weather_line, psi_text]
         if with_pm25_advice:
             parts.append(pm25_text)
         parts.append(weather_section(data, towns=towns, note=note, max_towns=4))
@@ -696,7 +732,7 @@ def band_for(value, bands):
     return bands[-1]
 
 
-def draw_map_panel(ax, title, reading, bands, unit=""):
+def draw_map_panel(ax, title, reading, bands, kind):
     ax.set_facecolor("#F3F7FB")
     ax.set_xlim(103.56, 104.08)
     ax.set_ylim(1.245, 1.485)
@@ -721,7 +757,8 @@ def draw_map_panel(ax, title, reading, bands, unit=""):
             facecolor=fill, edgecolor="white", linewidth=2, zorder=3))
         ax.text(lon, lat + 0.009, region.upper(), ha="center", va="center",
                 fontsize=8.5, fontweight="bold", color=ink, zorder=4)
-        ax.text(lon, lat - 0.008, f"{value}", ha="center", va="center",
+        arrow = trend_symbol(reading, region, kind)[0]
+        ax.text(lon, lat - 0.008, f"{value} {arrow}".strip(), ha="center", va="center",
                 fontsize=18, fontweight="bold", color=ink, zorder=4)
 
 
@@ -748,8 +785,8 @@ def make_map_image(data):
         fig.patch.set_facecolor("white")
         psi_title = "24-hour PSI" + (f" · {as_of(psi)}" if psi else "")
         pm_title = "1-hour PM2.5 (µg/m³)" + (f" · {as_of(pm25)}" if pm25 else "")
-        draw_map_panel(fig.add_axes([0.03, 0.6727, 0.94, 0.2909]), psi_title, psi, PSI_BANDS)
-        draw_map_panel(fig.add_axes([0.03, 0.3409, 0.94, 0.2909]), pm_title, pm25, PM25_BANDS)
+        draw_map_panel(fig.add_axes([0.03, 0.6727, 0.94, 0.2909]), psi_title, psi, PSI_BANDS, "psi")
+        draw_map_panel(fig.add_axes([0.03, 0.3409, 0.94, 0.2909]), pm_title, pm25, PM25_BANDS, "pm25")
 
         legend = fig.add_axes([0.03, 0.0546, 0.94, 0.2636])
         legend.axis("off")
@@ -765,6 +802,9 @@ def make_map_image(data):
                     transform=legend.transAxes)
         draw_legend_row(legend, 0.83, "24-hour PSI", PSI_BANDS)
         draw_legend_row(legend, 0.43, "1-hour PM2.5 (µg/m³)", PM25_BANDS)
+        fig.text(0.03, 0.034,
+                 "Arrows show the change since the previous hour: ▲ rising · ▼ easing · → steady",
+                 fontsize=8.5, color="#6B7280")
         fig.text(0.03, 0.016,
                  "Schematic map, not to scale · Source: NEA / data.gov.sg",
                  fontsize=8.5, color="#6B7280")
@@ -774,6 +814,172 @@ def make_map_image(data):
         return output
     finally:
         plt.close(fig)
+
+
+# ==========================================================
+# TRENDS, BAND CHANGES AND RECORD ALERTS
+# ==========================================================
+KINDS = {
+    "psi": (PSI_URL, "psi_twenty_four_hourly", PSI_BANDS, "PSI"),
+    "pm25": (PM25_URL, "pm25_one_hourly", PM25_BANDS, "PM2.5"),
+}
+RECORD_WINDOW_DAYS = 30   # "highest in N days" looks back this far.
+RECORD_MIN_DAYS = 14      # No record alerts until this many past days are known.
+ALERT_MIN = {"psi": 100, "pm25": 55}       # Record alerts only above these values.
+ALERT_BAND_INDEX = {"psi": 2, "pm25": 2}   # Band-change alerts: Unhealthy+ / High+.
+
+
+def band_index(value, bands):
+    for index, band in enumerate(bands):
+        if band[0] is None or value <= band[0]:
+            return index
+    return len(bands) - 1
+
+
+def get_previous_values(url, field, reading_time):
+    """Regional values for the hour before `reading_time` (None if not found)."""
+    target = (reading_time - timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    for item in fetch_items(target.date(), url=url):
+        stamp = parse_time(item["timestamp"]).replace(minute=0, second=0, microsecond=0)
+        if stamp == target:
+            try:
+                return read_values(item, field)
+            except (ValueError, KeyError, TypeError):
+                return None
+    return None
+
+
+def add_previous(data):
+    for kind, (url, field, _bands, _name) in KINDS.items():
+        reading = data.get(kind)
+        if not reading:
+            continue
+        try:
+            reading["previous"] = get_previous_values(url, field, reading["time"])
+        except ERRORS as error:
+            print(f"Previous-hour {kind} unavailable ({type(error).__name__}).")
+            reading["previous"] = None
+
+
+def load_records():
+    if RECORDS_FILE.exists():
+        try:
+            records = json.loads(RECORDS_FILE.read_text(encoding="utf-8"))
+            if isinstance(records, dict) and isinstance(records.get("daily_max"), dict):
+                return records
+        except ValueError:
+            pass
+    return {"daily_max": {}}
+
+
+def day_max(day, url, field):
+    """Highest regional reading on `day`: {'value', 'region', 'time'} or None."""
+    best = None
+    for item in fetch_items(day, url=url):
+        try:
+            values = read_values(item, field)
+            stamp = parse_time(item["timestamp"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        for region in REGIONS:
+            if best is None or values[region] > best["value"]:
+                best = {"value": values[region], "region": region,
+                        "time": stamp.isoformat()}
+    return best
+
+
+def fill_missing_days(records, today):
+    """Fetch each past day's highest reading once; later runs reuse the saved file."""
+    daily = records["daily_max"]
+    failures = 0
+    for offset in range(1, RECORD_WINDOW_DAYS + 1):
+        day = today - timedelta(days=offset)
+        entry = daily.setdefault(day.isoformat(), {})
+        for kind, (url, field, _bands, _name) in KINDS.items():
+            if kind in entry:
+                continue
+            if failures >= 3:  # Probably rate-limited; try again next hour.
+                return
+            try:
+                entry[kind] = day_max(day, url, field)  # None = no data that day.
+                time_module.sleep(0.25)
+            except ERRORS as error:
+                failures += 1
+                print(f"History for {day} ({kind}) unavailable ({type(error).__name__}).")
+
+
+def update_today(records, data):
+    for kind in KINDS:
+        reading = data.get(kind)
+        if not reading:
+            continue
+        values = reading["values"]
+        highest = max(values.values())
+        entry = records["daily_max"].setdefault(reading["time"].date().isoformat(), {})
+        current = entry.get(kind)
+        if not current or highest > current["value"]:
+            entry[kind] = {"value": highest, "region": first_top_region(values),
+                           "time": reading["time"].isoformat()}
+
+
+def record_alerts(data, records):
+    """Alert lines (HTML) for band jumps since last hour and record highs."""
+    record_lines, band_lines = [], []
+    daily = records["daily_max"]
+    for kind, (_url, _field, bands, name) in KINDS.items():
+        reading = data.get(kind)
+        if not reading or reading["stale"]:
+            continue
+        values = reading["values"]
+        highest, top = top_regions(values)
+
+        previous = reading.get("previous")
+        alerted = records.setdefault("band_alerted", {})
+        reading_key = reading["time"].isoformat()
+        if previous and alerted.get(kind) != reading_key:
+            moved = []
+            for region in REGIONS:
+                new = band_index(values[region], bands)
+                if new >= ALERT_BAND_INDEX[kind] and new > band_index(previous[region], bands):
+                    moved.append(f"{region.title()} → {bands[new][1]}")
+            if moved:
+                shown = ", ".join(moved[:3])
+                if len(moved) > 3:
+                    shown += f" +{len(moved) - 3} more"
+                band_lines.append(f"⬆️ {name} moved up a band: {escape(shown)}")
+                alerted[kind] = reading_key
+
+        if highest > ALERT_MIN[kind]:
+            day = reading["time"].date()
+            earlier_today = ((daily.get(day.isoformat()) or {}).get(kind) or {}).get("value", 0)
+            window = []
+            for day_key, entry in daily.items():
+                try:
+                    when = date.fromisoformat(day_key)
+                except ValueError:
+                    continue
+                past = (entry or {}).get(kind)
+                if past and 0 < (day - when).days <= RECORD_WINDOW_DAYS:
+                    window.append((when, past["value"]))
+            if (len(window) >= RECORD_MIN_DAYS and highest > earlier_today
+                    and highest > max(value for _when, value in window)):
+                span = (day - min(when for when, _value in window)).days
+                record_lines.append(
+                    f"🚨 <b>{name} {highest} ({escape(top)}): highest in {span} days</b>")
+    return record_lines + band_lines
+
+
+def save_records(records, today):
+    cutoff = today - timedelta(days=RECORD_WINDOW_DAYS + 5)
+    kept = {}
+    for key, entry in records["daily_max"].items():
+        try:
+            if date.fromisoformat(key) >= cutoff:
+                kept[key] = entry
+        except ValueError:
+            continue
+    records["daily_max"] = kept
+    save_text(RECORDS_FILE, json.dumps(records, indent=1, sort_keys=True) + "\n")
 
 
 # ==========================================================
@@ -813,6 +1019,16 @@ def send_hourly_update(token, chat_id):
         print("Every data source failed; nothing to send.")
         return True
 
+    # Extra context (trend arrows, alerts). Never blocks the update itself.
+    records = load_records()
+    try:
+        add_previous(data)
+        fill_missing_days(records, now.date())
+        data["alerts"] = record_alerts(data, records)
+        update_today(records, data)
+    except ERRORS as error:
+        print(f"Trend/record context unavailable ({type(error).__name__}).")
+
     sent = False
     if SEND_MAP_IMAGE and ("psi" in data or "pm25" in data):
         try:
@@ -845,6 +1061,10 @@ def send_hourly_update(token, chat_id):
     for key, path in (("psi", STATE_FILE), ("pm25", PM25_STATE_FILE)):
         if key in data:
             save_text(path, data[key]["time"].isoformat() + "\n")
+    try:
+        save_records(records, now.date())
+    except ERRORS as error:
+        print(f"Could not save records ({type(error).__name__}).")
     return failed
 
 
