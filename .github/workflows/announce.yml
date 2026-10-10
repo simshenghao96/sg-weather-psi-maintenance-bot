@@ -1,0 +1,37 @@
+name: Post Official Announcement
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: "Announcement text (plain text, max 800 characters)"
+        required: true
+        type: string
+      link:
+        description: "Optional official link (must start with https://)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Send announcement
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANNOUNCE_TEXT: ${{ inputs.message }}
+          ANNOUNCE_LINK: ${{ inputs.link }}
+        run: python announce.py
