@@ -1,0 +1,40 @@
+name: SG PSI and Weather Bot
+
+on:
+  workflow_dispatch:          # manual "Run workflow" button
+  repository_dispatch:        # lets an external cron service trigger it
+    types: [run-bot]
+
+permissions:
+  contents: write             # needed to commit the state files
+
+concurrency:
+  group: sg-bot
+  cancel-in-progress: false   # never run two at once
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python psi_bot.py
+
+      - name: Save state files
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add psi_reports.json last_sent_psi.txt last_sent_pm25.txt 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "Update bot state" && git push)
