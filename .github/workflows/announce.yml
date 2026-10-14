@@ -1,37 +1,93 @@
-name: Post Official Announcement
+name: Post or Schedule Announcement
 
 on:
   workflow_dispatch:
     inputs:
-      message:
-        description: "Announcement text (plain text, max 800 characters)"
+      action:
+        description: "Post now, schedule/edit a future message, or cancel by ID"
         required: true
+        type: choice
+        options: [post_now, schedule, cancel]
+        default: post_now
+      kind:
+        description: "Announcement type"
+        required: true
+        type: choice
+        options: [official_update, feature_update, maintenance_start, maintenance_complete, admin_announcement]
+        default: admin_announcement
+      message:
+        description: "Plain text, max 800 characters; leave blank only for cancel"
+        required: false
         type: string
+        default: ""
       link:
-        description: "Optional official link (must start with https://)"
+        description: "Optional https source link"
+        required: false
+        type: string
+        default: ""
+      publish_at:
+        description: "For schedule: Singapore time YYYY-MM-DD HH:MM (24-hour clock)"
+        required: false
+        type: string
+        default: ""
+      announcement_id:
+        description: "Optional ID for schedule; reuse it to edit, or enter it to cancel"
         required: false
         type: string
         default: ""
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: sg-bot
+  cancel-in-progress: false
 
 jobs:
   post:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: pip install requests
-
-      - name: Send announcement
+      - name: Post, schedule or cancel announcement
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANNOUNCE_ACTION: ${{ inputs.action }}
+          ANNOUNCE_KIND: ${{ inputs.kind }}
           ANNOUNCE_TEXT: ${{ inputs.message }}
           ANNOUNCE_LINK: ${{ inputs.link }}
+          ANNOUNCE_PUBLISH_AT: ${{ inputs.publish_at }}
+          ANNOUNCE_ID: ${{ inputs.announcement_id }}
         run: python announce.py
+      - name: Save announcement queue
+        if: always()
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ ! -f scheduled_announcements.json ]; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -- scheduled_announcements.json
+          if git diff --cached --quiet; then
+            echo "No queue changes."
+            exit 0
+          fi
+          git commit -m "Update scheduled announcement queue"
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:$DEFAULT_BRANCH"; then
+              exit 0
+            fi
+            git pull --rebase origin "$DEFAULT_BRANCH" || exit 1
+          done
+          echo "Could not save announcement queue."
+          exit 1
