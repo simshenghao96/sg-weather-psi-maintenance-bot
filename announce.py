@@ -1,56 +1,185 @@
-"""Post a one-off official announcement to the Telegram channel.
+"""Post, schedule, edit or cancel administrator announcements.
 
-Run manually from GitHub: Actions -> "Post Official Announcement" -> Run workflow.
-Required secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Scheduled messages are sent by the regular bot or its five-minute monitor.
+No new server, credentials or Python dependencies are required.
 """
+import json
 import os
 import sys
+import uuid
+from datetime import datetime
 from html import escape
+from pathlib import Path
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 
+SGT = ZoneInfo("Asia/Singapore")
+QUEUE_FILE = Path(__file__).resolve().parent / "scheduled_announcements.json"
 MAX_TEXT = 800
+TITLES = {
+    "official_update": "📢 Official update",
+    "feature_update": "✨ Bot feature update",
+    "maintenance_start": "🛠 Maintenance notice",
+    "maintenance_complete": "✅ Maintenance complete",
+    "admin_announcement": "📢 Admin announcement",
+}
 
 
-def main():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    text = os.environ.get("ANNOUNCE_TEXT", "").strip()
-    link = os.environ.get("ANNOUNCE_LINK", "").strip()
+def parse_publish_time(value):
+    moment = datetime.fromisoformat(value.strip())
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=SGT)
+    return moment.astimezone(SGT)
 
-    if not token or not chat_id:
-        print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret.")
-        return 1
-    if not text:
-        print("No announcement text was given.")
-        return 1
-    if len(text) > MAX_TEXT:
-        print(f"Announcement is {len(text)} characters; the limit is {MAX_TEXT}.")
-        return 1
-    if link and (not link.startswith("https://") or any(c in link for c in ' "<>')):
-        print("The link must start with https:// and contain no spaces or quotes.")
-        return 1
 
-    message = "📢 <b>Official update</b>\n" + escape(text)
+def save_queue(queue):
+    temporary = QUEUE_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(queue, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.replace(QUEUE_FILE)
+
+
+def validate_message(text, link, kind):
+    if not text or len(text) > MAX_TEXT:
+        raise ValueError("Enter announcement text between 1 and 800 characters.")
+    if kind not in TITLES:
+        raise ValueError("Unknown announcement type.")
     if link:
-        message += f'\n\n<a href="{escape(link, quote=True)}">Read the full announcement</a>'
+        parsed = urlparse(link)
+        if (parsed.scheme != "https" or not parsed.hostname
+                or any(c.isspace() or c in '\"<>' for c in link)
+                or parsed.username or parsed.password):
+            raise ValueError("Use a valid https:// source link without spaces or credentials.")
 
+
+def load_queue():
+    if not QUEUE_FILE.exists():
+        return []
+    queue = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
+    if not isinstance(queue, list):
+        raise ValueError("Invalid scheduled_announcements.json; expected a list.")
+    seen = set()
+    for item in queue:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid announcement entry.")
+        job_id = item["id"]
+        if not isinstance(job_id, str) or not job_id or job_id in seen:
+            raise ValueError("Invalid or duplicated announcement ID.")
+        seen.add(job_id)
+        if item["status"] not in ("scheduled", "sent", "cancelled"):
+            raise ValueError("Invalid announcement status.")
+        parse_publish_time(item["publish_at"])
+        validate_message(item["message"], item.get("link", ""), item["kind"])
+    return queue
+
+
+def send_announcement(token, chat_id, text, link="", kind="official_update"):
+    validate_message(text, link, kind)
+    message = f"<b>{escape(TITLES[kind])}</b>\n\n{escape(text)}"
+    if link:
+        message += f'\n\n<a href="{escape(link, quote=True)}">Read the source</a>'
+    message += "\n\n<b>Automatically posted · Prepared by the administrator.</b>"
     try:
         response = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": message, "parse_mode": "HTML",
-                  "link_preview_options": {"is_disabled": True}},
-            timeout=30,
+                  "link_preview_options": {"is_disabled": True}}, timeout=30,
         )
-        ok = response.status_code == 200 and response.json().get("ok")
+        result = response.json()
     except (requests.RequestException, ValueError):
-        # Never print the exception: it can contain the bot token.
-        print("Could not reach Telegram; delivery is unconfirmed.")
+        raise RuntimeError("Telegram connection failed; delivery is unconfirmed.") from None
+    if response.status_code != 200 or not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError("Telegram rejected the announcement. Check secrets and posting permissions.")
+
+
+def schedule_announcement(text, link, kind, publish_at, job_id="", now=None):
+    now = now or datetime.now(SGT)
+    validate_message(text, link, kind)
+    due = parse_publish_time(publish_at)
+    if due <= now:
+        raise ValueError("Choose a future Singapore publish time, or use post_now.")
+    queue = load_queue()
+    job_id = job_id or uuid.uuid4().hex[:12]
+    existing = next((item for item in queue if item["id"] == job_id), None)
+    if existing and existing["status"] == "sent":
+        raise ValueError("This ID has already been sent. Use a new ID.")
+    item = {"id": job_id, "message": text, "link": link, "kind": kind,
+            "publish_at": due.isoformat(), "status": "scheduled",
+            "created_at": (existing or {}).get("created_at", now.isoformat())}
+    if existing:
+        existing.clear()
+        existing.update(item)
+    else:
+        queue.append(item)
+    save_queue(queue)
+    return job_id, due
+
+
+def cancel_announcement(job_id):
+    queue = load_queue()
+    existing = next((item for item in queue if item["id"] == job_id), None)
+    if not existing:
+        raise ValueError("Announcement ID not found.")
+    if existing["status"] == "sent":
+        raise ValueError("This announcement was already sent and cannot be cancelled.")
+    existing["status"] = "cancelled"
+    save_queue(queue)
+
+
+def send_due_announcements(token, chat_id, now=None):
+    now = now or datetime.now(SGT)
+    queue = load_queue()
+    due = sorted((item for item in queue if item["status"] == "scheduled"
+                  and parse_publish_time(item["publish_at"]) <= now),
+                 key=lambda item: (parse_publish_time(item["publish_at"]), item["id"]))
+    failed = False
+    for item in due[:5]:
+        try:
+            send_announcement(token, chat_id, item["message"], item.get("link", ""), item["kind"])
+            # Record immediately after Telegram confirms delivery.
+            item["status"] = "sent"
+            item["sent_at"] = now.isoformat()
+            save_queue(queue)
+            print(f"Scheduled announcement sent: {item['id']}")
+        except (RuntimeError, OSError):
+            print(f"Scheduled announcement failed: {item['id']}; retry next run.")
+            failed = True
+            # Preserve chronological order and avoid repeated requests on failure.
+            break
+    return failed
+
+
+def main():
+    action = os.environ.get("ANNOUNCE_ACTION", "post_now").strip()
+    text = os.environ.get("ANNOUNCE_TEXT", "").strip()
+    link = os.environ.get("ANNOUNCE_LINK", "").strip()
+    kind = os.environ.get("ANNOUNCE_KIND", "official_update").strip()
+    publish_at = os.environ.get("ANNOUNCE_PUBLISH_AT", "").strip()
+    job_id = os.environ.get("ANNOUNCE_ID", "").strip()
+    try:
+        if action == "schedule":
+            job_id, due = schedule_announcement(text, link, kind, publish_at, job_id)
+            print(f"Announcement saved. ID: {job_id}; due: {due:%d %b %Y, %I:%M %p} SGT")
+        elif action == "cancel":
+            if not job_id:
+                raise ValueError("Enter the announcement ID to cancel.")
+            cancel_announcement(job_id)
+            print(f"Announcement cancelled: {job_id}")
+        elif action == "post_now":
+            token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+            chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+            if not token or not chat_id:
+                raise ValueError("Missing Telegram secrets.")
+            send_announcement(token, chat_id, text, link, kind)
+            print("Announcement sent.")
+        else:
+            raise ValueError("Choose post_now, schedule or cancel.")
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError) as error:
+        print(f"Announcement action failed ({type(error).__name__}).")
+        if isinstance(error, (ValueError, RuntimeError)):
+            print(str(error))
         return 1
-    if not ok:
-        print("Telegram rejected the announcement. Check the bot's permissions and secrets.")
-        return 1
-    print("Announcement sent.")
     return 0
 
 
