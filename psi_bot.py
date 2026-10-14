@@ -48,6 +48,7 @@ STATE_FILE = BASE_DIR / "last_sent_psi.txt"
 PM25_STATE_FILE = BASE_DIR / "last_sent_pm25.txt"
 REPORT_FILE = BASE_DIR / "psi_reports.json"
 RECORDS_FILE = BASE_DIR / "psi_records.json"
+URGENT_STATE_FILE = BASE_DIR / "air_quality_alerts.json"
 
 STALE_SECONDS = 7200  # Readings older than 2 hours are flagged.
 MAX_MESSAGE_LENGTH = 4000  # Telegram's limit is 4096.
@@ -1059,6 +1060,92 @@ def save_records(records, today):
 
 
 # ==========================================================
+# STANDALONE THRESHOLD ALERTS
+# ==========================================================
+def urgent_level(value, metric):
+    if metric == "pm25":
+        return int(value >= 251)
+    if value >= 301:
+        return 2  # Send another alert if PSI escalates to Hazardous.
+    return int(value >= 201)
+
+
+def check_urgent_alerts(token, chat_id, data=None, now=None):
+    """One alert per region entering a severe band; rearm after it drops below.
+
+    The first check also warns about an already-severe reading. It does not
+    claim a historical record or a crossing when no earlier sample is known.
+    """
+    now = now or datetime.now(SGT)
+    state = (json.loads(URGENT_STATE_FILE.read_text(encoding="utf-8"))
+             if URGENT_STATE_FILE.exists() else {})
+    if not isinstance(state, dict):
+        raise ValueError("Invalid air_quality_alerts.json.")
+    failed = False
+    for metric, label, getter, indicator in [
+        ("pm25", "1-hour PM2.5", get_pm25, get_pm25_indicator),
+        ("psi", "24-hour PSI", get_psi, get_psi_indicator),
+    ]:
+        try:
+            reading = getter(now) if data is None else data.get(metric)
+            if not reading:
+                continue
+            timestamp = reading["time"]
+            age = (now - timestamp).total_seconds()
+            if reading["stale"] or age > STALE_SECONDS or age < -300:
+                print(f"Skipping outdated or future {label} alert data.")
+                continue
+            previous = state.get(metric)
+            if previous is not None:
+                if timestamp <= parse_time(previous["timestamp"]):
+                    continue  # Ignore repeats and out-of-order data.
+                previous_values = previous["values"]
+                if not all(is_number(previous_values[r]) for r in REGIONS):
+                    raise ValueError("Invalid saved alert readings.")
+            else:
+                previous_values = None
+            changed = []
+            for region in REGIONS:
+                value = reading["values"][region]
+                level = urgent_level(value, metric)
+                prior_level = (urgent_level(previous_values[region], metric)
+                               if previous_values is not None else 0)
+                if level and level > prior_level:
+                    changed.append(region)
+            if changed:
+                unit = " µg/m³" if metric == "pm25" else ""
+                title = (f"🚨 ALERT — {label.upper()} ABOVE THRESHOLD"
+                         if previous is None else
+                         f"🚨 ALERT — {label.upper()} ENTERED A HIGHER ALERT BAND")
+                lines = [f"<b>{escape(title)}</b>",
+                         f"Reading time: {timestamp:%d %b %Y, %I:%M %p} SGT", ""]
+                for region in changed:
+                    value = reading["values"][region]
+                    lines.append(f"<b>{region.title()}: {value}{unit} — "
+                                 f"{escape(indicator(value))}</b>")
+                if metric == "pm25":
+                    lines += ["", "<b>Next hour: minimise outdoor activity. "
+                              "Vulnerable people should avoid outdoor activity.</b>"]
+                else:
+                    maximum = max(reading["values"][r] for r in changed)
+                    lines += ["", "<b>Advice based on the highest PSI in this alert:</b>"]
+                    lines += [f"<b>{escape(line)}</b>" for line in get_health_advisory(maximum)]
+                lines += ["", "Automated threshold alert · NEA / data.gov.sg",
+                          "https://www.haze.gov.sg/"]
+                send_telegram_message(token, chat_id, "\n".join(lines))
+                print(f"Standalone {label} alert sent for {', '.join(changed)}.")
+            # Advance only after an alert succeeds, or when none was needed.
+            # Lower readings are saved as well, enabling future re-entry alerts.
+            state[metric] = {"timestamp": timestamp.isoformat(),
+                             "values": reading["values"]}
+            save_text(URGENT_STATE_FILE, json.dumps(state, indent=2) + "\n")
+        except ERRORS as error:
+            print(f"{label} alert check failed ({type(error).__name__}); retry next check.")
+            failed = True
+    return failed
+
+
+# ==========================================================
 # HOURLY UPDATE
 # ==========================================================
 def send_hourly_update(token, chat_id):
@@ -1079,6 +1166,13 @@ def send_hourly_update(token, chat_id):
             print(f"{label} unavailable ({type(error).__name__}).")
             failed = True
 
+    # Do not hold an already available severe reading during the hourly wait.
+    try:
+        failed = check_urgent_alerts(token, chat_id, data, now) or failed
+    except ERRORS as error:
+        print(f"Urgent alert state failed ({type(error).__name__}).")
+        failed = True
+
     # Give NEA time to publish the current hour's PSI / PM2.5 before sending.
     deadline = time_module.monotonic() + WAIT_FOR_LATEST_MINUTES * 60
     while (any(key in data and data[key]["behind"] for key in ("psi", "pm25"))
@@ -1094,6 +1188,13 @@ def send_hourly_update(token, chat_id):
     if not data:
         print("Every data source failed; nothing to send.")
         return True
+
+    # A newer reading may have appeared during the wait.
+    try:
+        failed = check_urgent_alerts(token, chat_id, data, datetime.now(SGT)) or failed
+    except ERRORS as error:
+        print(f"Urgent alert check failed ({type(error).__name__}).")
+        failed = True
 
     # Extra context (trend arrows, alerts). Never blocks the update itself.
     records = load_records()
@@ -1148,19 +1249,22 @@ def send_hourly_update(token, chat_id):
 # ==========================================================
 # MIDNIGHT DAILY / WEEKLY PSI CHART REPORTS (unchanged)
 # ==========================================================
-def period_rows(start, end, cache):
+def period_rows(start, end, cache, metric="psi"):
     # end is exclusive. Fetch history rather than relying on prior bot runs.
+    url = PM25_URL if metric == "pm25" else PSI_URL
+    field = "pm25_one_hourly" if metric == "pm25" else "psi_twenty_four_hourly"
     rows = {}
     day = start.date()
     while day < end.date():
-        if day not in cache:
-            cache[day] = fetch_items(day)
-        for item in cache[day]:
+        cache_key = (metric, day)
+        if cache_key not in cache:
+            cache[cache_key] = fetch_items(day, url=url)
+        for item in cache[cache_key]:
             timestamp = parse_time(item["timestamp"])
             if not start <= timestamp < end:
                 continue
             try:
-                values = read_values(item)
+                values = read_values(item, field)
             except (ValueError, KeyError, TypeError):
                 continue  # A missing/invalid hour becomes a gap, never zero.
             # Use the newest revision if the API repeats a reading timestamp.
@@ -1175,11 +1279,14 @@ def period_rows(start, end, cache):
     return hourly
 
 
-def make_chart(kind, start, end, hourly):
+def make_chart(kind, start, end, hourly, metric="psi"):
     hours = int((end - start).total_seconds() // 3600)
     times = [start + timedelta(hours=i) for i in range(hours)]
     period = (f"{start:%d %b %Y}" if kind == "daily" else
               f"{start:%d %b %Y} - {end - timedelta(days=1):%d %b %Y}")
+    label = "1-hour PM2.5" if metric == "pm25" else "PSI"
+    footnote = ("Hourly 1-hour PM2.5 concentrations." if metric == "pm25" else
+                "Hourly snapshots of 24-hour PSI.")
     fig, ax = plt.subplots(figsize=(12, 6.8), dpi=160)
     try:
         fig.patch.set_facecolor("#F7F9FC")
@@ -1189,9 +1296,9 @@ def make_chart(kind, start, end, hourly):
             ax.plot(times, values, label=region.title(), color=color,
                     linestyle=style, linewidth=2, marker="o",
                     markersize=3 if kind == "daily" else 1.6, alpha=0.85)
-        ax.set_title(f"Singapore PSI | {kind.title()} Report\n{period}",
+        ax.set_title(f"Singapore {label} | {kind.title()} Report\n{period}",
                      fontsize=18, fontweight="bold", pad=20)
-        ax.set_ylabel("24-hour PSI", fontsize=12)
+        ax.set_ylabel("1-hour PM2.5 (µg/m³)" if metric == "pm25" else "24-hour PSI", fontsize=12)
         ax.set_xlabel("Time (Singapore time)" if kind == "daily" else "Date (Singapore time)")
         ax.set_xlim(start, end - timedelta(minutes=1))
         ax.set_ylim(bottom=0)
@@ -1206,7 +1313,7 @@ def make_chart(kind, start, end, hourly):
         ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=5, frameon=False)
         fig.text(0.06, 0.035,
                  f"Source: NEA / data.gov.sg | Hours available: {len(hourly)}/{hours}\n"
-                 "Hourly snapshots of 24-hour PSI. Missing hours are gaps; equal readings may overlap.",
+                 + footnote + " Missing hours are gaps; equal readings may overlap.",
                  fontsize=9, color="#475569")
         fig.subplots_adjust(left=0.08, right=0.98, top=0.83, bottom=0.28)
         output = io.BytesIO()
@@ -1273,6 +1380,35 @@ def get_report_caption(kind, period, hours, hourly):
     return "\n".join(lines)
 
 
+def get_pm25_report_caption(period, hours, hourly):
+    entries = [(values[r], timestamp, r) for timestamp, values in sorted(hourly.items())
+               for r in REGIONS]
+    if not entries:
+        raise ValueError("No PM2.5 readings for the report.")
+    low = min(entries, key=lambda entry: entry[0])
+    high = max(entries, key=lambda entry: entry[0])
+    def describe(entry):
+        value, timestamp, region = entry
+        return f"{value} µg/m³ — {region.title()}, {timestamp:%I:%M %p}"
+    bands = list(dict.fromkeys(get_pm25_indicator(value)
+                              for value in sorted({entry[0] for entry in entries})))
+    elevated = sum(any(values[r] >= 56 for r in REGIONS) for values in hourly.values())
+    high_hours = sum(any(values[r] >= 151 for r in REGIONS) for values in hourly.values())
+    lines = ["📊 Singapore 1-hour PM2.5 — Daily Summary", period, "",
+             "Recorded bands: " + "; ".join(bands),
+             "⬇️ Lowest: " + describe(low), "⬆️ Highest: " + describe(high),
+             "", f"Hours with Elevated or higher in any region: {elevated}/{len(hourly)}",
+             f"Hours with High or Very High in any region: {high_hours}/{len(hourly)}"]
+    if sum(entry[0] == low[0] for entry in entries) > 1 or sum(entry[0] == high[0] for entry in entries) > 1:
+        lines.append("Ties: earliest hour, then first region shown.")
+    lines += ["", f"Hours available: {len(hourly)}/{hours}."]
+    if len(hourly) < hours:
+        lines.append("⚠️ Incomplete data: summary covers available readings; missing hours are chart gaps.")
+    lines += ["Past-hour concentrations, not 24-hour PSI.", "All times SGT.",
+              "Source: NEA / data.gov.sg"]
+    return "\n".join(lines)
+
+
 def check_reports(token, chat_id, now=None):
     now = now or datetime.now(SGT)
     today = datetime.combine(now.date(), time.min, tzinfo=SGT)
@@ -1281,31 +1417,36 @@ def check_reports(token, chat_id, now=None):
     if not isinstance(state, dict):
         raise ValueError("Invalid report state.")
     cache, failed = {}, False
-    for kind, end, days in [("daily", today, 1), ("weekly", monday, 7)]:
+    for kind, end, days, metric, state_key in [
+        ("daily", today, 1, "psi", "daily"),
+        ("weekly", monday, 7, "psi", "weekly"),
+        ("daily", today, 1, "pm25", "daily_pm25"),
+    ]:
         start = end - timedelta(days=days)
         key = (end - timedelta(days=1)).date().isoformat()
         try:
-            previous = state.get(kind)
+            previous = state.get(state_key)
             if previous is not None and date.fromisoformat(previous) >= date.fromisoformat(key):
                 continue
-            hourly = period_rows(start, end, cache)
+            hourly = period_rows(start, end, cache, metric)
             expected = days * 24
             if not hourly:
                 raise ValueError("No historical readings available.")
             # Allow delayed readings to appear during the first hour after midnight.
             if len(hourly) < expected and now < end + timedelta(hours=1):
-                print(f"{kind.title()} chart waiting for missing readings; retry next run.")
+                print(f"{metric.upper()} {kind.title()} chart waiting for missing readings; retry next run.")
                 continue
-            picture, period, hours = make_chart(kind, start, end, hourly)
-            caption = get_report_caption(kind, period, hours, hourly)
+            picture, period, hours = make_chart(kind, start, end, hourly, metric)
+            caption = (get_pm25_report_caption(period, hours, hourly) if metric == "pm25"
+                       else get_report_caption(kind, period, hours, hourly))
             with picture:
                 telegram_request(token, "sendPhoto", data={"chat_id": chat_id, "caption": caption},
-                                 files={"photo": (f"psi_{kind}_{key}.png", picture, "image/png")})
-            state[kind] = key
+                                 files={"photo": (f"{metric}_{kind}_{key}.png", picture, "image/png")})
+            state[state_key] = key
             save_text(REPORT_FILE, json.dumps(state, indent=2) + "\n")
-            print(f"{kind.title()} chart sent for period ending {key}.")
+            print(f"{metric.upper()} {kind.title()} chart sent for period ending {key}.")
         except ERRORS as error:
-            print(f"{kind.title()} report failed ({type(error).__name__}); retry next run.")
+            print(f"{metric.upper()} {kind.title()} report failed ({type(error).__name__}); retry next run.")
             failed = True
     return failed
 
@@ -1320,11 +1461,19 @@ def main():
         print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret.")
         return 1
 
+    mode = os.environ.get("BOT_MODE", "update").strip().lower()
+    if mode not in ("update", "monitor"):
+        print("BOT_MODE must be update or monitor.")
+        return 1
     failed = False
     try:
-        failed = send_hourly_update(token, chat_id)
+        if mode == "monitor":
+            # No weather broadcast, 10-minute wait, or 30-day history fetch.
+            failed = check_urgent_alerts(token, chat_id)
+        else:
+            failed = send_hourly_update(token, chat_id)
     except ERRORS as error:
-        print(f"Hourly update failed ({type(error).__name__}).")
+        print(f"{mode.title()} run failed ({type(error).__name__}).")
         failed = True
 
     # Reports must still run even if the hourly update had a problem.
