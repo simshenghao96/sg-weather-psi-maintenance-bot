@@ -1,22 +1,35 @@
 name: SG PSI and Weather Bot
 
 on:
-  workflow_dispatch:          # manual "Run workflow" button
-  repository_dispatch:        # lets an external cron service trigger it
-    types: [run-bot]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "update = regular broadcast; monitor = alerts and due charts only"
+        type: choice
+        options:
+          - update
+          - monitor
+        default: update
+        required: true
+  repository_dispatch:
+    types: [run-bot, run-monitor]
 
 permissions:
-  contents: write             # needed to commit the state files
+  contents: write
 
 concurrency:
   group: sg-bot
-  cancel-in-progress: false   # never run two at once
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -29,15 +42,32 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DATA_GOV_SG_API_KEY: ${{ secrets.DATA_GOV_SG_API_KEY }}  # optional
+          DATA_GOV_SG_API_KEY: ${{ secrets.DATA_GOV_SG_API_KEY }}
+          BOT_MODE: ${{ github.event_name == 'repository_dispatch' && (github.event.action == 'run-monitor' && 'monitor' || 'update') || inputs.mode || 'update' }}
         run: python psi_bot.py
 
       - name: Save state files
         if: always()
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          for f in psi_reports.json psi_records.json last_sent_psi.txt last_sent_pm25.txt; do
-            [ -f "$f" ] && git add "$f"
+          for f in psi_reports.json psi_records.json air_quality_alerts.json last_sent_psi.txt last_sent_pm25.txt; do
+            if [ -f "$f" ]; then
+              git add -- "$f"
+            fi
           done
-          git diff --cached --quiet || (git commit -m "Update bot state" && git push)
+          if git diff --cached --quiet; then
+            echo "No state changes."
+            exit 0
+          fi
+          git commit -m "Update bot state"
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:$DEFAULT_BRANCH"; then
+              exit 0
+            fi
+            git pull --rebase origin "$DEFAULT_BRANCH" || exit 1
+          done
+          echo "State push failed; a later run may repeat a message."
+          exit 1
