@@ -1,22 +1,22 @@
 {
   "pm25": {
-    "timestamp": "2026-10-18T17:00:00+08:00",
+    "timestamp": "2026-10-18T18:00:00+08:00",
     "values": {
       "north": 36,
-      "south": 35,
-      "east": 82,
-      "west": 68,
-      "central": 56
+      "south": 69,
+      "east": 67,
+      "west": 66,
+      "central": 69
     }
   },
   "psi": {
-    "timestamp": "2026-10-18T17:00:00+08:00",
+    "timestamp": "2026-10-18T18:00:00+08:00",
     "values": {
-      "north": 112,
-      "south": 142,
-      "east": 146,
-      "west": 197,
-      "central": 152
+      "north": 109,
+      "south": 137,
+      "east": 142,
+      "west": 192,
+      "central": 147
     }
   }
 }
