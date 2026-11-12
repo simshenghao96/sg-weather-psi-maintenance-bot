@@ -1,18 +1,18 @@
 {
   "pm25": {
-    "timestamp": "2026-11-12T07:00:00+08:00",
+    "timestamp": "2026-11-12T08:00:00+08:00",
     "values": {
-      "north": 11,
+      "north": 17,
       "south": 13,
       "east": 13,
-      "west": 21,
-      "central": 21
+      "west": 15,
+      "central": 18
     }
   },
   "psi": {
-    "timestamp": "2026-11-12T07:00:00+08:00",
+    "timestamp": "2026-11-12T08:00:00+08:00",
     "values": {
-      "north": 53,
+      "north": 54,
       "south": 55,
       "east": 55,
       "west": 59,
